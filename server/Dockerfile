@@ -1,5 +1,6 @@
 FROM python:3.11-slim
 
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     xz-utils \
@@ -9,9 +10,13 @@ RUN apt-get update && apt-get install -y \
     make \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-ENV PATH="/root/bin:${PATH}"
+# Install arduino-cli explicitly to /usr/local/bin
+RUN curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s latest -- --bindir /usr/local/bin
 
+# Verify installation
+RUN arduino-cli version
+
+# Install Arduino AVR core
 RUN arduino-cli core update-index && \
     arduino-cli core install arduino:avr
 

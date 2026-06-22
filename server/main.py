@@ -21,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ARDUINO_CLI = "/root/bin/arduino-cli"
+ARDUINO_CLI = "/usr/local/bin/arduino-cli"
 
 class CompileRequest(BaseModel):
     sketch: str
