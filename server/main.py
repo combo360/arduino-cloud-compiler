@@ -10,6 +10,10 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Arduino Cloud Compiler")
 
+@app.get("/")
+async def root():
+    return {"status": "Arduino Cloud Compiler is running"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
