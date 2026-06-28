@@ -18,14 +18,14 @@ RUN wget -q https://github.com/arduino/arduino-cli/releases/download/v0.35.3/ard
     rm /tmp/arduino-cli.tar.gz && \
     chmod +x /usr/local/bin/arduino-cli
 
-# Configure arduino-cli and install cores + common built-in libraries
+# Install Arduino cores and standalone libraries
 RUN arduino-cli config init && \
     arduino-cli core update-index && \
     arduino-cli core install arduino:avr && \
     arduino-cli core install arduino:samd && \
     arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json && \
     arduino-cli lib update-index && \
-    arduino-cli lib install "Servo" "Stepper" "Ethernet" "SD" "WiFiNINA" "LiquidCrystal" "SPI" "Wire" "EEPROM"
+    arduino-cli lib install "Servo" "Stepper" "Ethernet" "SD" "WiFiNINA" "LiquidCrystal"
 
 WORKDIR /app
 COPY requirements.txt .
