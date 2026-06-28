@@ -18,7 +18,7 @@ RUN wget -q https://github.com/arduino/arduino-cli/releases/download/v0.35.3/ard
     rm /tmp/arduino-cli.tar.gz && \
     chmod +x /usr/local/bin/arduino-cli
 
-# Install Arduino cores and standalone libraries
+# Install Arduino cores and standalone libraries only
 RUN arduino-cli config init && \
     arduino-cli core update-index && \
     arduino-cli core install arduino:avr && \
