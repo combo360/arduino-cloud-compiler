@@ -7,7 +7,7 @@ import re
 import json
 import hashlib
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -16,13 +16,17 @@ app = FastAPI(title="Arduino Cloud Compiler")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "GET"],
+    allow_methods=["POST", "GET", "DELETE"],
     allow_headers=["*"],
 )
 
 ARDUINO_CLI = "/usr/local/bin/arduino-cli"
 PERSISTENT_BUILD_DIR = Path("/tmp/arduino-build-cache")
 PERSISTENT_BUILD_DIR.mkdir(exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODELS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class CompileRequest(BaseModel):
     sketch: str
@@ -35,6 +39,20 @@ class CompileResponse(BaseModel):
     logs: str
     hex: str | None = None
     binary: str | None = None
+
+class InstallRequest(BaseModel):
+    name: str
+    version: str | None = None
+
+class BoardInstallRequest(BaseModel):
+    core: str  # e.g. "arduino:avr", "esp32:esp32"
+
+class AdditionalUrlRequest(BaseModel):
+    url: str
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_cmd(cmd: list[str], timeout: int = 120) -> tuple[int, str, str]:
     try:
@@ -66,7 +84,7 @@ def extract_includes(sketch_code: str) -> set[str]:
 def resolve_library_name(include_name: str) -> str | None:
     base = include_name.replace(".h", "")
     lookup = base.lower()
-    
+
     core_headers = {
         "arduino", "spi", "wire", "eeprom", "softwareserial", "hardwareserial",
         "wprogram", "wconstants", "pins_arduino", "avr/io", "avr/interrupt",
@@ -79,7 +97,7 @@ def resolve_library_name(include_name: str) -> str | None:
     }
     if lookup in core_headers:
         return None
-    
+
     mappings = {
         "servo": "Servo",
         "stepper": "Stepper",
@@ -140,7 +158,7 @@ def install_libraries(libraries: list[str], logs: list[str]) -> None:
     if not to_install:
         logs.append("All libraries already installed.")
         return
-    
+
     logs.append(f"Installing: {to_install}")
     for lib in to_install:
         rc, out, err = run_cmd([ARDUINO_CLI, "lib", "install", lib], 120)
@@ -159,6 +177,10 @@ def auto_detect_libraries(sketch_code: str) -> list[str]:
             libs.append(name)
     return list(dict.fromkeys(libs))
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# HEALTH / ROOT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/")
 async def root():
     return {"status": "Arduino Cloud Compiler is running"}
@@ -166,6 +188,10 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "cli": shutil.which(ARDUINO_CLI) is not None}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMPILATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/v1/libraries")
 async def list_libraries():
@@ -175,23 +201,21 @@ async def list_libraries():
 @app.post("/v1/compile", response_model=CompileResponse)
 async def compile_sketch(req: CompileRequest):
     logs = []
-    
+
     auto_libs = auto_detect_libraries(req.sketch)
     all_libs = list(dict.fromkeys(auto_libs + req.libraries))
     logs.append(f"Libraries needed: {all_libs}")
-    
+
     install_libraries(all_libs, logs)
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         sketch_dir = Path(tmpdir) / "sketch"
         sketch_dir.mkdir()
         (sketch_dir / "sketch.ino").write_text(req.sketch, encoding="utf-8")
-        
-        # Use FQBN-based build dir (not sketch-hash) so core is reused
+
         build_dir = PERSISTENT_BUILD_DIR / req.fqbn.replace(":", "_")
         build_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Use sketch-specific subdir for the .hex output
+
         sketch_hash = hashlib.md5(req.sketch.encode()).hexdigest()[:12]
         output_dir = build_dir / f"out_{sketch_hash}"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -219,11 +243,195 @@ async def compile_sketch(req: CompileRequest):
             return CompileResponse(success=False, logs="\n".join(logs) + "\n\nNo .hex generated")
 
         hex_data = base64.b64encode(hex_files[0].read_bytes()).decode()
-        
+
         bin_files = list(output_dir.glob("*.bin"))
         bin_data = base64.b64encode(bin_files[0].read_bytes()).decode() if bin_files else None
 
         return CompileResponse(success=True, logs="\n".join(logs), hex=hex_data, binary=bin_data)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BOARDS MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/v1/boards/installed")
+async def list_installed_boards():
+    """List all installed board cores."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "core", "list", "--format", "json"], 30)
+    if rc != 0:
+        return []
+    try:
+        cores = json.loads(stdout)
+        boards = []
+        for core in cores:
+            for board in core.get("boards", []):
+                boards.append({
+                    "name": board.get("name", "Unknown"),
+                    "fqbn": board.get("fqbn", ""),
+                    "core": core.get("id", ""),
+                    "version": core.get("installed", ""),
+                })
+        return boards
+    except Exception:
+        return []
+
+@app.get("/v1/boards/search")
+async def search_boards(query: str = Query("")):
+    """Search available board cores."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "core", "search", query, "--format", "json"], 60)
+    if rc != 0:
+        return []
+    try:
+        return json.loads(stdout)
+    except Exception:
+        return []
+
+@app.post("/v1/boards/install")
+async def install_board(req: BoardInstallRequest):
+    """Install a board core."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "core", "install", req.core], 300)
+    success = rc == 0
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+@app.delete("/v1/boards/uninstall")
+async def uninstall_board(core: str = Query(...)):
+    """Uninstall a board core."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "core", "uninstall", core], 120)
+    success = rc == 0
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+@app.get("/v1/boards/urls")
+async def get_additional_urls():
+    """Get additional boards manager URLs."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "config", "dump", "--format", "json"], 30)
+    if rc != 0:
+        return {"urls": []}
+    try:
+        config = json.loads(stdout)
+        urls = config.get("board_manager", {}).get("additional_urls", [])
+        return {"urls": urls if isinstance(urls, list) else [urls]}
+    except Exception:
+        return {"urls": []}
+
+@app.post("/v1/boards/urls")
+async def add_additional_url(req: AdditionalUrlRequest):
+    """Add an additional boards manager URL."""
+    rc, stdout, stderr = run_cmd(
+        [ARDUINO_CLI, "config", "add", "board_manager.additional_urls", req.url], 30
+    )
+    # Update index after adding URL
+    run_cmd([ARDUINO_CLI, "core", "update-index"], 60)
+    success = rc == 0
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+@app.delete("/v1/boards/urls")
+async def remove_additional_url(url: str = Query(...)):
+    """Remove an additional boards manager URL."""
+    rc, stdout, stderr = run_cmd(
+        [ARDUINO_CLI, "config", "remove", "board_manager.additional_urls", url], 30
+    )
+    success = rc == 0
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIBRARY MANAGER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/v1/libraries/installed")
+async def list_installed_libraries_detailed():
+    """List all installed libraries with details."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "lib", "list", "--format", "json"], 30)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(stdout)
+        libraries = []
+        for item in data:
+            lib = item.get("library", {})
+            libraries.append({
+                "name": lib.get("name", ""),
+                "author": lib.get("author", ""),
+                "version": lib.get("version", ""),
+                "sentence": lib.get("sentence", ""),
+                "paragraph": lib.get("paragraph", ""),
+                "url": lib.get("website", ""),
+                "category": lib.get("category", ""),
+                "architectures": lib.get("architectures", []),
+                "install_dir": lib.get("install_dir", ""),
+            })
+        return libraries
+    except Exception:
+        return []
+
+@app.get("/v1/libraries/search")
+async def search_libraries(query: str = Query("")):
+    """Search available libraries."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "lib", "search", query, "--format", "json"], 60)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(stdout)
+        return data.get("libraries", [])
+    except Exception:
+        return []
+
+@app.post("/v1/libraries/install")
+async def install_library(req: InstallRequest):
+    """Install a library."""
+    cmd = [ARDUINO_CLI, "lib", "install", req.name]
+    if req.version:
+        cmd.extend(["--version", req.version])
+    rc, stdout, stderr = run_cmd(cmd, 300)
+    success = rc == 0
+    # Invalidate cache
+    global _INSTALLED_LIBS_CACHE
+    _INSTALLED_LIBS_CACHE = None
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+@app.delete("/v1/libraries/uninstall")
+async def uninstall_library(name: str = Query(...)):
+    """Uninstall a library."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "lib", "uninstall", name], 120)
+    success = rc == 0
+    global _INSTALLED_LIBS_CACHE
+    _INSTALLED_LIBS_CACHE = None
+    return {
+        "success": success,
+        "message": stdout if success else stderr,
+    }
+
+@app.get("/v1/libraries/versions")
+async def list_library_versions(name: str = Query(...)):
+    """List available versions of a library."""
+    rc, stdout, stderr = run_cmd([ARDUINO_CLI, "lib", "search", name, "--format", "json"], 60)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(stdout)
+        for lib in data.get("libraries", []):
+            if lib.get("name", "").lower() == name.lower():
+                return lib.get("available_versions", [])
+        return []
+    except Exception:
+        return []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
