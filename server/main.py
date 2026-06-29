@@ -187,20 +187,22 @@ async def compile_sketch(req: CompileRequest):
         sketch_dir.mkdir()
         (sketch_dir / "sketch.ino").write_text(req.sketch, encoding="utf-8")
         
-        sketch_hash = hashlib.md5((req.fqbn + req.sketch).encode()).hexdigest()[:16]
-        build_dir = PERSISTENT_BUILD_DIR / f"{req.fqbn.replace(':', '_')}_{sketch_hash}"
+        # Use FQBN-based build dir (not sketch-hash) so core is reused
+        build_dir = PERSISTENT_BUILD_DIR / req.fqbn.replace(":", "_")
         build_dir.mkdir(parents=True, exist_ok=True)
         
-        cache_dir = PERSISTENT_BUILD_DIR / ".cache"
-        cache_dir.mkdir(exist_ok=True)
+        # Use sketch-specific subdir for the .hex output
+        sketch_hash = hashlib.md5(req.sketch.encode()).hexdigest()[:12]
+        output_dir = build_dir / f"out_{sketch_hash}"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
             ARDUINO_CLI,
             "compile",
             "--fqbn", req.fqbn,
-            "--output-dir", str(build_dir),
+            "--output-dir", str(output_dir),
             "--build-path", str(build_dir / ".build"),
-            "--build-cache-path", str(cache_dir),
+            "--build-cache-path", str(build_dir / ".cache"),
             "--build-property", "compiler.optimization_flags=-Os",
             str(sketch_dir),
         ]
@@ -212,13 +214,13 @@ async def compile_sketch(req: CompileRequest):
         if rc != 0:
             return CompileResponse(success=False, logs="\n".join(logs))
 
-        hex_files = list(build_dir.glob("*.hex"))
+        hex_files = list(output_dir.glob("*.hex"))
         if not hex_files:
             return CompileResponse(success=False, logs="\n".join(logs) + "\n\nNo .hex generated")
 
         hex_data = base64.b64encode(hex_files[0].read_bytes()).decode()
         
-        bin_files = list(build_dir.glob("*.bin"))
+        bin_files = list(output_dir.glob("*.bin"))
         bin_data = base64.b64encode(bin_files[0].read_bytes()).decode() if bin_files else None
 
         return CompileResponse(success=True, logs="\n".join(logs), hex=hex_data, binary=bin_data)
