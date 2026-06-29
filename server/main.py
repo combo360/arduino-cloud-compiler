@@ -5,6 +5,8 @@ import tempfile
 import subprocess
 import re
 import json
+import hashlib
+import multiprocessing
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,12 +22,15 @@ app.add_middleware(
 )
 
 ARDUINO_CLI = "/usr/local/bin/arduino-cli"
+PERSISTENT_BUILD_DIR = Path("/tmp/arduino-build-cache")
+PERSISTENT_BUILD_DIR.mkdir(exist_ok=True)
+JOBS = multiprocessing.cpu_count()
 
 class CompileRequest(BaseModel):
     sketch: str
     fqbn: str = "arduino:avr:uno"
     optimize: str = "size"
-    libraries: list[str] = Field(default_factory=list, description="Extra libraries to install")
+    libraries: list[str] = Field(default_factory=list)
 
 class CompileResponse(BaseModel):
     success: bool
@@ -33,121 +38,128 @@ class CompileResponse(BaseModel):
     hex: str | None = None
     binary: str | None = None
 
-def get_installed_libraries() -> set[str]:
-    """Get set of already installed library names (case-insensitive)."""
+def run_cmd(cmd: list[str], timeout: int = 120) -> tuple[int, str, str]:
     try:
-        result = subprocess.run(
-            [ARDUINO_CLI, "lib", "list", "--format", "json"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return set()
-        libs = json.loads(result.stdout)
-        return {lib["library"]["name"].lower() for lib in libs}
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        return -1, "", f"TIMEOUT after {timeout}s"
+
+def get_installed_libraries() -> set[str]:
+    rc, stdout, _ = run_cmd([ARDUINO_CLI, "lib", "list", "--format", "json"], 30)
+    if rc != 0:
+        return set()
+    try:
+        return {lib["library"]["name"].lower() for lib in json.loads(stdout)}
     except Exception:
         return set()
 
+_INSTALLED_LIBS_CACHE: set[str] | None = None
+
+def get_installed_libraries_cached() -> set[str]:
+    global _INSTALLED_LIBS_CACHE
+    if _INSTALLED_LIBS_CACHE is None:
+        _INSTALLED_LIBS_CACHE = get_installed_libraries()
+    return _INSTALLED_LIBS_CACHE
+
 def extract_includes(sketch_code: str) -> set[str]:
-    """Extract #include <Library.h> or #include "Library.h" from sketch."""
-    pattern = r'#include\s*[<"]([^>"]+)[>"]'
-    return set(re.findall(pattern, sketch_code))
+    return set(re.findall(r'#include\s*[<"]([^>"]+)[>"]', sketch_code))
 
 def resolve_library_name(include_name: str) -> str | None:
-    """
-    Map header file to library name.
-    Many match directly, but some don't (e.g., WiFi.h -> WiFiNINA or WiFi)
-    """
-    # Strip .h extension for direct mapping
     base = include_name.replace(".h", "")
+    lookup = base.lower()
     
-    # Known mappings where header != library name
+    core_headers = {
+        "arduino", "spi", "wire", "eeprom", "softwareserial", "hardwareserial",
+        "wprogram", "wconstants", "pins_arduino", "avr/io", "avr/interrupt",
+        "avr/pgmspace", "avr/sleep", "avr/wdt", "util/delay", "stdlib",
+        "string", "math", "stdio", "stdint", "stdbool", "inttypes", "ctype",
+        "time", "assert", "errno", "stddef", "limits", "float", "setjmp",
+        "signal", "avr/power", "avr/eeprom", "avr/sfr_defs", "avr/common",
+        "avr/version", "avr/fuse", "avr/lock", "avr/boot", "avr/cpufunc",
+        "avr/builtins", "avr/io",
+    }
+    if lookup in core_headers:
+        return None
+    
     mappings = {
-        "wifi": "WiFiNINA",           # or "WiFi" for ESP32
-        "wifiserver": "WiFiNINA",
-        "wificlient": "WiFiNINA",
-        "softwareserial": "SoftwareSerial",
-        "eeprom": "EEPROM",
-        "spi": "SPI",
-        "wire": "Wire",
         "servo": "Servo",
         "stepper": "Stepper",
         "ethernet": "Ethernet",
         "sd": "SD",
+        "wifinina": "WiFiNINA",
         "liquidcrystal": "LiquidCrystal",
-        "neopixel": "Adafruit NeoPixel",
-        "dht": "DHT sensor library",
-        "onewire": "OneWire",
         "liquidcrystal_i2c": "LiquidCrystal I2C",
+        "dht": "DHT sensor library",
+        "dht11": "DHT sensor library",
+        "dht22": "DHT sensor library",
+        "onewire": "OneWire",
+        "dallastemperature": "DallasTemperature",
+        "dallas_temperature": "DallasTemperature",
+        "neopixel": "Adafruit NeoPixel",
+        "adafruit_gfx": "Adafruit GFX Library",
+        "adafruit_ssd1306": "Adafruit SSD1306",
+        "adafruit_sensor": "Adafruit Unified Sensor",
+        "adafruit_bmp280": "Adafruit BMP280 Library",
+        "adafruit_bme280": "Adafruit BME280 Library",
+        "adafruit_bme680": "Adafruit BME680 Library",
+        "adafruit_mpu6050": "Adafruit MPU6050",
+        "adafruit_neopixel": "Adafruit NeoPixel",
+        "irremote": "IRremote",
+        "fastled": "FastLED",
         "tmrpcm": "TMRpcm",
+        "newping": "NewPing",
         "rf24": "RF24",
         "mpu6050": "MPU6050",
-        "servotimer2": "ServoTimer2",
-        "altsoftserial": "AltSoftSerial",
-        "newping": "NewPing",
-        "irremote": "IRremote",
+        "arduinojson": "ArduinoJson",
+        "json": "ArduinoJson",
+        "pubsubclient": "PubSubClient",
+        "mqtt": "PubSubClient",
+        "blynk": "Blynk",
+        "thingspeak": "ThingSpeak",
+        "wifimanager": "WiFiManager",
+        "espasyncwebserver": "ESPAsyncWebServer",
+        "asyncmqttclient": "AsyncMqttClient",
+        "painlessmesh": "painlessMesh",
+        "nimble": "NimBLE-Arduino",
+        "tft_espi": "TFT_eSPI",
+        "u8g2": "U8g2",
+        "lvgl": "lvgl",
+        "ledcontrol": "LedControl",
+        "tm1637": "TM1637Display",
+        "pcf8574": "PCF8574",
+        "pcf8575": "PCF8575",
+        "mcp23017": "Adafruit MCP23017 Arduino Library",
+        "mcp3008": "Adafruit_MCP3008",
+        "mcp4725": "Adafruit MCP4725",
+        "mcp9808": "Adafruit MCP9808 Library",
     }
-    
-    lookup = base.lower()
-    if lookup in mappings:
-        return mappings[lookup]
-    
-    # Try direct match first
-    return base
+    return mappings.get(lookup, base)
 
-def install_libraries(libraries: list[str], logs: list[str]) -> bool:
-    """Install missing libraries. Returns True if all succeeded."""
-    installed = get_installed_libraries()
-    to_install = []
-    
-    for lib in libraries:
-        if lib.lower() not in installed:
-            to_install.append(lib)
-    
+def install_libraries(libraries: list[str], logs: list[str]) -> None:
+    installed = get_installed_libraries_cached()
+    to_install = [lib for lib in libraries if lib.lower() not in installed]
     if not to_install:
-        return True
+        logs.append("All libraries already installed.")
+        return
     
-    logs.append(f"Installing libraries: {', '.join(to_install)}")
-    
+    logs.append(f"Installing: {to_install}")
     for lib in to_install:
-        try:
-            result = subprocess.run(
-                [ARDUINO_CLI, "lib", "install", lib],
-                capture_output=True, text=True, timeout=120
-            )
-            logs.append(result.stdout or "")
-            if result.stderr:
-                logs.append(result.stderr)
-            if result.returncode != 0:
-                logs.append(f"WARNING: Failed to install {lib}")
-                # Don't fail immediately — let compilation try anyway
-        except subprocess.TimeoutExpired:
-            logs.append(f"TIMEOUT installing {lib}")
-    
-    return True
+        rc, out, err = run_cmd([ARDUINO_CLI, "lib", "install", lib], 120)
+        logs.append(out)
+        if err:
+            logs.append(f"WARN: {err}")
+        if rc == 0:
+            installed.add(lib.lower())
 
 def auto_detect_libraries(sketch_code: str) -> list[str]:
-    """Auto-detect required libraries from #include directives."""
     includes = extract_includes(sketch_code)
-    libraries = []
-    
-    # Built-in/core headers to skip (part of the core, not libraries)
-    core_headers = {
-        "arduino.h", "avr/io.h", "avr/interrupt.h", "avr/pgmspace.h",
-        "avr/sleep.h", "avr/wdt.h", "util/delay.h", "stdlib.h", 
-        "string.h", "math.h", "stdio.h", "stdint.h", "stdbool.h",
-        "inttypes.h", "ctype.h", "time.h", "assert.h", "errno.h",
-        "stddef.h", "limits.h", "float.h", "setjmp.h", "signal.h",
-    }
-    
-    for include in includes:
-        if include.lower() in core_headers:
-            continue
-        
-        lib_name = resolve_library_name(include)
-        if lib_name:
-            libraries.append(lib_name)
-    
-    return libraries
+    libs = []
+    for inc in includes:
+        name = resolve_library_name(inc)
+        if name:
+            libs.append(name)
+    return list(dict.fromkeys(libs))
 
 @app.get("/")
 async def root():
@@ -155,97 +167,67 @@ async def root():
 
 @app.get("/health")
 async def health():
-    cli_ok = shutil.which(ARDUINO_CLI) is not None
-    return {"status": "ok", "cli": cli_ok}
+    return {"status": "ok", "cli": shutil.which(ARDUINO_CLI) is not None}
 
 @app.get("/v1/libraries")
 async def list_libraries():
-    """List all installed libraries."""
-    try:
-        result = subprocess.run(
-            [ARDUINO_CLI, "lib", "list", "--format", "json"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=result.stderr)
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {"libraries": []}
+    rc, stdout, _ = run_cmd([ARDUINO_CLI, "lib", "list", "--format", "json"], 30)
+    return json.loads(stdout) if rc == 0 else []
 
 @app.post("/v1/compile", response_model=CompileResponse)
 async def compile_sketch(req: CompileRequest):
-    log_lines = []
+    logs = []
     
-    # Auto-detect + user-specified libraries
+    # Auto-detect + user libraries
     auto_libs = auto_detect_libraries(req.sketch)
-    all_libs = list(dict.fromkeys(auto_libs + req.libraries))  # preserve order, remove dups
-    log_lines.append(f"Detected libraries: {all_libs}")
+    all_libs = list(dict.fromkeys(auto_libs + req.libraries))
+    logs.append(f"Libraries needed: {all_libs}")
     
-    # Install missing libraries
-    install_libraries(all_libs, log_lines)
+    # Install missing (cached check)
+    install_libraries(all_libs, logs)
     
     with tempfile.TemporaryDirectory() as tmpdir:
         sketch_dir = Path(tmpdir) / "sketch"
         sketch_dir.mkdir()
-        sketch_file = sketch_dir / "sketch.ino"
-        sketch_file.write_text(req.sketch, encoding="utf-8")
+        (sketch_dir / "sketch.ino").write_text(req.sketch, encoding="utf-8")
         
-        build_dir = Path(tmpdir) / "build"
-        build_dir.mkdir()
+        # Persistent build dir for caching
+        sketch_hash = hashlib.md5((req.fqbn + req.sketch).encode()).hexdigest()[:16]
+        build_dir = PERSISTENT_BUILD_DIR / f"{req.fqbn.replace(':', '_')}_{sketch_hash}"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        
+        cache_dir = PERSISTENT_BUILD_DIR / ".cache"
+        cache_dir.mkdir(exist_ok=True)
 
         cmd = [
             ARDUINO_CLI,
             "compile",
             "--fqbn", req.fqbn,
             "--output-dir", str(build_dir),
+            "--build-path", str(build_dir / ".build"),
+            "--build-cache-path", str(cache_dir),
+            "--jobs", str(JOBS),
             "--build-property", "compiler.optimization_flags=-Os",
-            "--verbose",
             str(sketch_dir),
         ]
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,  # Increased for library installs
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="Compilation timed out")
+        rc, stdout, stderr = run_cmd(cmd, 300)
+        logs.append(stdout)
+        logs.append(stderr)
 
-        logs = "\n".join(log_lines) + "\n\n" + (proc.stdout or "") + (proc.stderr or "")
-
-        if proc.returncode != 0:
-            return CompileResponse(success=False, logs=logs)
+        if rc != 0:
+            return CompileResponse(success=False, logs="\n".join(logs))
 
         hex_files = list(build_dir.glob("*.hex"))
         if not hex_files:
-            return CompileResponse(
-                success=False,
-                logs=logs + "\n\nError: No .hex file generated",
-            )
+            return CompileResponse(success=False, logs="\n".join(logs) + "\n\nNo .hex generated")
 
-        hex_path = hex_files[0]
-        hex_data = base64.b64encode(hex_path.read_bytes()).decode("utf-8")
-
+        hex_data = base64.b64encode(hex_files[0].read_bytes()).decode()
+        
         bin_files = list(build_dir.glob("*.bin"))
-        bin_data = None
-        if bin_files:
-            bin_data = base64.b64encode(bin_files[0].read_bytes()).decode("utf-8")
+        bin_data = base64.b64encode(bin_files[0].read_bytes()).decode() if bin_files else None
 
-        return CompileResponse(
-            success=True,
-            logs=logs,
-            hex=hex_data,
-            binary=bin_data,
-        )
-
-@app.post("/v1/install-libs")
-async def install_libraries_endpoint(libraries: list[str]):
-    """Manually install libraries."""
-    logs = []
-    install_libraries(libraries, logs)
-    return {"installed": libraries, "logs": "\n".join(logs)}
+        return CompileResponse(success=True, logs="\n".join(logs), hex=hex_data, binary=bin_data)
 
 if __name__ == "__main__":
     import uvicorn
