@@ -1,31 +1,29 @@
 FROM python:3.11-slim
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
-    xz-utils \
-    gcc-avr \
-    avr-libc \
-    avrdude \
-    make \
-    wget \
-    git \
+    curl xz-utils gcc-avr avr-libc avrdude make wget git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install arduino-cli
 RUN wget -q https://github.com/arduino/arduino-cli/releases/download/v0.35.3/arduino-cli_0.35.3_Linux_64bit.tar.gz -O /tmp/arduino-cli.tar.gz && \
     tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin/ && \
     rm /tmp/arduino-cli.tar.gz && \
     chmod +x /usr/local/bin/arduino-cli
 
-# Install Arduino cores
+# Install cores
 RUN arduino-cli config init && \
     arduino-cli core update-index && \
     arduino-cli core install arduino:avr && \
     arduino-cli core install arduino:samd && \
     arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-# Pre-install popular libraries in ONE layer
+# Pre-compile cores to warm cache (MASSIVE speedup for first compile)
+RUN mkdir -p /tmp/warmup && \
+    echo 'void setup(){} void loop(){}' > /tmp/warmup/warmup.ino && \
+    arduino-cli compile --fqbn arduino:avr:uno --build-cache-path /tmp/arduino-cache /tmp/warmup && \
+    arduino-cli compile --fqbn arduino:samd:arduino_zero_native --build-cache-path /tmp/arduino-cache /tmp/warmup && \
+    rm -rf /tmp/warmup
+
+# Pre-install popular libraries
 RUN arduino-cli lib update-index && \
     arduino-cli lib install \
         "Servo" "Stepper" "Ethernet" "SD" "WiFiNINA" "LiquidCrystal" \
