@@ -6,7 +6,6 @@ import subprocess
 import re
 import json
 import hashlib
-import multiprocessing
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +23,6 @@ app.add_middleware(
 ARDUINO_CLI = "/usr/local/bin/arduino-cli"
 PERSISTENT_BUILD_DIR = Path("/tmp/arduino-build-cache")
 PERSISTENT_BUILD_DIR.mkdir(exist_ok=True)
-JOBS = multiprocessing.cpu_count()
 
 class CompileRequest(BaseModel):
     sketch: str
@@ -178,12 +176,10 @@ async def list_libraries():
 async def compile_sketch(req: CompileRequest):
     logs = []
     
-    # Auto-detect + user libraries
     auto_libs = auto_detect_libraries(req.sketch)
     all_libs = list(dict.fromkeys(auto_libs + req.libraries))
     logs.append(f"Libraries needed: {all_libs}")
     
-    # Install missing (cached check)
     install_libraries(all_libs, logs)
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -191,7 +187,6 @@ async def compile_sketch(req: CompileRequest):
         sketch_dir.mkdir()
         (sketch_dir / "sketch.ino").write_text(req.sketch, encoding="utf-8")
         
-        # Persistent build dir for caching
         sketch_hash = hashlib.md5((req.fqbn + req.sketch).encode()).hexdigest()[:16]
         build_dir = PERSISTENT_BUILD_DIR / f"{req.fqbn.replace(':', '_')}_{sketch_hash}"
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +201,6 @@ async def compile_sketch(req: CompileRequest):
             "--output-dir", str(build_dir),
             "--build-path", str(build_dir / ".build"),
             "--build-cache-path", str(cache_dir),
-            "--jobs", str(JOBS),
             "--build-property", "compiler.optimization_flags=-Os",
             str(sketch_dir),
         ]
