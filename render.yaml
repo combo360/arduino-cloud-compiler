@@ -1,0 +1,28 @@
+# Render Blueprint for the i-Droid compile server (server/).
+# Render reads this file from the repository root.
+# Spec: https://render.com/docs/blueprint-spec
+# A persistent disk keeps installed cores and per-user libraries across
+# deploys. Disks need a paid instance type (free instances sleep and lose
+# their filesystem).
+services:
+  - type: web
+    name: idroid-compile-server
+    runtime: docker
+    rootDir: server
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: idroid-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: IDROID_API_KEYS
+        sync: false # e.g. "k3y-for-alice:alice,k3y-for-bob:bob"
+      - key: IDROID_ADMIN_KEYS
+        sync: false # e.g. "long-random-admin-key:admin"
+      - key: IDROID_ALLOW_ANONYMOUS
+        value: "false"
+      - key: IDROID_COMPILES_PER_MINUTE
+        value: "10"
+      - key: IDROID_MAX_CONCURRENT_COMPILES
+        value: "2"

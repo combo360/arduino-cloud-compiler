@@ -1,0 +1,29 @@
+# Libraries baked into the Docker image and shared by every user, so common
+# sketches compile without an API key. One library name per line, exactly as
+# in the Arduino Library Manager. Taken from the original i-Droid server.
+Servo
+Stepper
+Ethernet
+SD
+LiquidCrystal
+LiquidCrystal I2C
+DHT sensor library
+Adafruit Unified Sensor
+Adafruit NeoPixel
+Adafruit GFX Library
+Adafruit SSD1306
+Adafruit BMP280 Library
+Adafruit BME280 Library
+Adafruit MPU6050
+OneWire
+DallasTemperature
+IRremote
+FastLED
+NewPing
+RF24
+MPU6050
+ArduinoJson
+PubSubClient
+U8g2
+TM1637
+LedControl

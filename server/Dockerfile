@@ -1,54 +1,71 @@
-FROM python:3.11-slim
+# i-Droid compile server: FastAPI + arduino-cli
+FROM python:3.12-slim-trixie
 
-RUN apt-get update && apt-get install -y \
-    curl xz-utils gcc-avr avr-libc avrdude make wget git \
-    && rm -rf /var/lib/apt/lists/*
+ARG ARDUINO_CLI_VERSION=1.2.2
+# Cores baked into the image so the first compile is fast. For ESP32 add
+#   --build-arg PREINSTALL_CORES="arduino:avr esp32:esp32"
+#   --build-arg PREINSTALL_URLS=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+# (the ESP32 core adds well over 1 GB to the image).
+ARG PREINSTALL_CORES="arduino:avr"
+ARG PREINSTALL_URLS=""
 
-RUN wget -q https://github.com/arduino/arduino-cli/releases/download/v0.35.3/arduino-cli_0.35.3_Linux_64bit.tar.gz -O /tmp/arduino-cli.tar.gz && \
-    tar -xzf /tmp/arduino-cli.tar.gz -C /usr/local/bin/ && \
-    rm /tmp/arduino-cli.tar.gz && \
-    chmod +x /usr/local/bin/arduino-cli
+# clang-format powers Auto Format (Arduino's style file is in app/).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates clang-format \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install cores
-RUN arduino-cli config init && \
-    arduino-cli core update-index && \
-    arduino-cli core install arduino:avr && \
-    arduino-cli core install arduino:samd && \
-    arduino-cli core install esp32:esp32 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+RUN curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+    | BINDIR=/usr/local/bin sh -s ${ARDUINO_CLI_VERSION}
 
-# Pre-compile cores to warm cache (MASSIVE speedup for first compile)
-RUN mkdir -p /tmp/warmup && \
-    echo 'void setup(){} void loop(){}' > /tmp/warmup/warmup.ino && \
-    arduino-cli compile --fqbn arduino:avr:uno --build-cache-path /tmp/arduino-cache /tmp/warmup && \
-    arduino-cli compile --fqbn arduino:samd:arduino_zero_native --build-cache-path /tmp/arduino-cache /tmp/warmup && \
-    rm -rf /tmp/warmup
+# Arduino's built-in examples (File > Examples in the desktop IDE).
+ARG ARDUINO_EXAMPLES_REF=main
+RUN mkdir -p /opt/arduino-examples \
+ && curl -fsSL https://codeload.github.com/arduino/arduino-examples/tar.gz/${ARDUINO_EXAMPLES_REF} \
+    | tar -xz -C /opt/arduino-examples --strip-components=1
+ENV IDROID_BUILTIN_EXAMPLES=/opt/arduino-examples/examples
 
-# Pre-install popular libraries
-RUN arduino-cli lib update-index && \
-    arduino-cli lib install \
-        "Servo" "Stepper" "Ethernet" "SD" "WiFiNINA" "LiquidCrystal" \
-        "DHT sensor library" "Adafruit NeoPixel" "Adafruit GFX Library" \
-        "Adafruit SSD1306" "Adafruit Unified Sensor" "OneWire" \
-        "DallasTemperature" "IRremote" "FastLED" "NewPing" "RF24" \
-        "MPU6050" "ArduinoJson" "PubSubClient" "Blynk" "ThingSpeak" \
-        "WiFiManager" "ESPAsyncWebServer" "AsyncMqttClient" "MQTT" \
-        "painlessMesh" "NimBLE-Arduino" "TFT_eSPI" "U8g2" "lvgl" \
-        "LedControl" "TM1637Display" "PCF8574" "Adafruit MCP23017 Arduino Library" \
-        "Adafruit_MCP3008" "Adafruit MCP4725" "Adafruit MCP9808 Library" \
-        "Adafruit BMP280 Library" "Adafruit BME280 Library" "Adafruit BME680 Library" \
-        "Adafruit MPU6050" "Adafruit VL53L0X" "Adafruit TCS34725" \
-        "Adafruit AMG88xx Library" "Adafruit SHT31 Library" "Adafruit SGP30 Sensor" \
-        "Adafruit CCS811 Library" "Adafruit seesaw Library" \
-        "Adafruit Fingerprint Sensor Library" "Adafruit PN532" \
-        "Adafruit Thermal Printer Library" "Adafruit GPS Library" \
-        "Adafruit SleepyDog Library" "Adafruit Zero DMA Library" \
-    || true
-
-WORKDIR /app
+RUN useradd --create-home --uid 10001 idroid
+WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
 
-COPY main.py .
-EXPOSE 8000
+COPY docker-entrypoint.sh /usr/local/bin/
+# Strip Windows line endings in case the file was edited on Windows.
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Cores, shared libraries and the core build cache are prepared under /opt at
+# build time. A volume mounted on /data would hide anything baked there, so the
+# entrypoint seeds /data from /opt on first start.
+ENV IDROID_DATA_DIR=/data
+RUN mkdir -p /data /opt/arduino15 /opt/arduino-shared /opt/build-cache \
+ && chown idroid:idroid /data /opt/arduino15 /opt/arduino-shared /opt/build-cache
+COPY preinstall-libraries.txt /opt/preinstall-libraries.txt
+USER idroid
+ENV ARDUINO_DIRECTORIES_DATA=/opt/arduino15 \
+    ARDUINO_DIRECTORIES_USER=/opt/arduino-shared \
+    ARDUINO_BUILD_CACHE_PATH=/opt/build-cache \
+    ARDUINO_UPDATER_ENABLE_NOTIFICATION=false
+RUN URLS=""; [ -n "${PREINSTALL_URLS}" ] && URLS="--additional-urls ${PREINSTALL_URLS}"; \
+    arduino-cli core update-index $URLS \
+ && for core in ${PREINSTALL_CORES}; do arduino-cli core install "$core" $URLS; done
+# Shared libraries: a failed library is reported in the build log but does not
+# stop the build (unlike the original server, the failure is visible).
+RUN arduino-cli lib update-index \
+ && sed 's/\r$//' /opt/preinstall-libraries.txt | grep -v '^#' | sed '/^$/d' | while IFS= read -r lib; do \
+      arduino-cli lib install "$lib" || echo "WARNING: could not install library: $lib"; \
+    done
+# Compile an empty sketch once so the Uno core is already in the build cache.
+RUN mkdir -p /tmp/warmup && printf 'void setup(){}\nvoid loop(){}\n' > /tmp/warmup/warmup.ino \
+ && arduino-cli compile --fqbn arduino:avr:uno /tmp/warmup \
+ && rm -rf /tmp/warmup
+# The server sets these per request; clear the build-time values.
+ENV ARDUINO_DIRECTORIES_DATA= ARDUINO_DIRECTORIES_USER= ARDUINO_BUILD_CACHE_PATH=
+
+# The entrypoint starts as root only to make the data disk writable (hosted
+# disks are often mounted owned by root), then runs the server as "idroid".
+USER root
+VOLUME ["/data"]
+EXPOSE 8080
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["sh", "-c", "uvicorn --factory app.main:create_app --host 0.0.0.0 --port ${PORT:-8080}"]
