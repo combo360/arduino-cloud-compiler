@@ -1,7 +1,8 @@
 """i-Droid compile server: an arduino-cli wrapper with API keys,
 per-user libraries, admin-only board cores and rate limits.
 
-Run locally:  uvicorn --factory app.main:create_app --port 8080
+Run locally:  uvicorn --factory app.main:create_app --port 8090
+(8090 rather than 8080, which is commonly taken by another dev server.)
 """
 
 from __future__ import annotations
@@ -18,10 +19,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import assistant as asist
 from . import cli as clib
+from . import mail
+from .assistant_keys import KeyStore
 from .config import Settings
 
 FQBN_RE = re.compile(r"^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+(:[A-Za-z0-9_.=,-]+)?$")
@@ -107,7 +111,17 @@ class RateLimiter:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        # The default /data only exists in the container, and on Windows the
+        # root of a drive needs administrator rights. Say so instead of dying in
+        # a traceback before the first request.
+        raise RuntimeError(
+            f"Cannot use the data folder '{settings.data_dir}': {error}\n"
+            "Set IDROID_DATA_DIR to a folder you can write to, for example "
+            f"'{Path.home() / 'idroid-data'}'."
+        ) from error
     arduino = clib.ArduinoCli(settings.arduino_cli, settings.data_dir)
     limiter = RateLimiter()
     compile_slots = asyncio.Semaphore(settings.max_concurrent_compiles)
@@ -147,7 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             return json.loads(settings.board_urls_file.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
-            return []
+            return list(settings.default_board_urls)
 
     def save_board_urls(urls: list[str]) -> None:
         settings.board_urls_file.write_text(json.dumps(urls, indent=2))
@@ -169,6 +183,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         shared = settings.shared_libraries_dir
         return await arduino.run(
             "compile", "--fqbn", req.fqbn, "--output-dir", str(out_dir),
+            "--build-path", str(out_dir.with_name("build-path")),
             *(["--libraries", str(shared)] if shared.is_dir() else []),
             *(["-v"] if req.verbose else []),
             str(sketch_dir),
@@ -222,6 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not installed_any:
                 break
             shutil.rmtree(out_dir, ignore_errors=True)
+            shutil.rmtree(out_dir.with_name("build-path"), ignore_errors=True)
             result = await run_compile(c, req, sketch_dir, out_dir)
         return result, notes
 
@@ -274,6 +290,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     elif bins:
                         response["binary"] = base64.b64encode(bins[0].read_bytes()).decode()
                         response["format"] = "bin"
+                        # ESP32 family: every image the board needs, with its
+                        # flash offset, read from the core's flash_args file.
+                        flash = clib.parse_flash_args(out_dir.with_name("build-path"))
+                        if flash is not None:
+                            response["flash"] = flash["settings"]
+                            response["images"] = flash["images"]
                     else:
                         response["success"] = False
                         response["logs"] += "\nNo firmware file was produced."
@@ -416,6 +438,107 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                               timeout=settings.install_timeout_s)
         return {"success": r.ok, "logs": r.logs}
 
+
+    # -- assistant (online model; the provider key stays on the server) ------
+
+    app.state.assistant_provider = asist.create_provider(settings)
+    app.state.assistant_keys = KeyStore(
+        settings.data_dir / "assistant_keys.json", settings.assistant_key_days)
+    # Swappable so a test (or another mail provider) can replace delivery.
+    app.state.assistant_send_key = mail.send_key
+    #: ip -> monotonic time of its last key request.
+    key_requests: dict[str, float] = {}
+    #: Answers served today, for the daily ceiling.
+    daily = {"day": "", "count": 0}
+
+    @app.get("/v1/assistant/info")
+    async def assistant_info(c: Caller = Depends(caller)):
+        provider = app.state.assistant_provider
+        enabled = settings.assistant_enabled and provider is not None
+        return {"enabled": enabled, "model": provider.model if enabled else None}
+
+    @app.post("/v1/assistant/request-key")
+    async def assistant_request_key(request: Request):
+        """Mints an access key and emails it to the operator.
+
+        Never returns the key: it goes to the operator's inbox, and they hand
+        it out. The response is identical whether or not a mail was sent, so
+        the endpoint cannot be probed.
+        """
+        provider = app.state.assistant_provider
+        if not settings.assistant_enabled or provider is None:
+            raise HTTPException(
+                status_code=501,
+                detail="The assistant is not set up on this server.",
+            )
+        ip = request.client.host if request.client else "unknown"
+        limiter.check(f"keyreq:{ip}", "keyreq", 3)
+        now = time.monotonic()
+        if now - key_requests.get(ip, 0.0) < settings.assistant_key_cooldown_s:
+            return {"requested": True}
+        key_requests[ip] = now
+        raw_key = app.state.assistant_keys.create(label=ip)
+        try:
+            channel = app.state.assistant_send_key(raw_key, requested_by=ip)
+        except Exception as error:  # noqa: BLE001 - the user cannot fix mail
+            print(f"[assistant] the key could not be sent: {error}", flush=True)
+            channel = "failed"
+        print(f"[assistant] key requested from {ip}, delivery: {channel}",
+              flush=True)
+        return {"requested": True}
+
+    @app.post("/v1/assistant/chat")
+    async def assistant_chat(req: asist.ChatRequest, request: Request,
+                             c: Caller = Depends(caller)):
+        provider = app.state.assistant_provider
+        if not settings.assistant_enabled or provider is None:
+            raise HTTPException(
+                status_code=501,
+                detail="The assistant is not set up on this server.",
+            )
+
+        bucket = c.key
+        if c.user == "anonymous":
+            # The public app carries no API key, so access comes from the word
+            # emailed to the operator. It is only a pass for the assistant: it
+            # can never identify anyone for compiling or installing.
+            word = request.headers.get("X-Assistant-Word", "").strip()
+            if word:
+                if not (word in settings.assistant_words
+                        or app.state.assistant_keys.accepts(word)):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="That assistant key is not valid. Request a new "
+                               "one from the app.",
+                    )
+                bucket = "word:" + word.lower()
+            elif not settings.assistant_allow_anonymous:
+                raise HTTPException(
+                    status_code=403,
+                    detail="An assistant key is needed. Request one from the "
+                           "app.",
+                )
+
+        # A rate limit caps speed, not the bill: this is the ceiling.
+        today = time.strftime("%Y-%m-%d")
+        if daily["day"] != today:
+            daily["day"], daily["count"] = today, 0
+        if (settings.assistant_daily_cap > 0
+                and daily["count"] >= settings.assistant_daily_cap):
+            raise HTTPException(
+                status_code=429,
+                detail="The assistant has reached its daily limit. Try again "
+                       "tomorrow.",
+            )
+
+        limiter.check(bucket, "assistant", settings.assistant_per_minute)
+        daily["count"] += 1
+        messages = asist.messages_for(req)
+        return StreamingResponse(
+            asist.stream_answer(provider, messages, req),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     # -- auto format (Arduino's ClangFormat style) ----------------------------
 
