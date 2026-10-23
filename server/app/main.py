@@ -441,7 +441,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # -- assistant (online model; the provider key stays on the server) ------
 
-    app.state.assistant_provider = asist.create_provider(settings)
+    try:
+        app.state.assistant_provider = asist.create_provider(settings)
+    except Exception as error:  # noqa: BLE001 - the compiler must keep working
+        # A misconfigured model provider must never stop the compile server
+        # from starting: compiling, boards and libraries keep working, and the
+        # app simply sees the assistant as disabled. This is exactly the failure
+        # that took the whole service down on Render.
+        print(f"[assistant] provider setup failed, assistant disabled: {error}",
+              flush=True)
+        app.state.assistant_provider = None
     app.state.assistant_keys = KeyStore(
         settings.data_dir / "assistant_keys.json", settings.assistant_key_days)
     # Swappable so a test (or another mail provider) can replace delivery.
