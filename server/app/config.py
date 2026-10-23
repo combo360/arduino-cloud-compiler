@@ -63,6 +63,10 @@ class Settings:
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    #: "openai" (the default, covering every OpenAI-shaped vendor) or
+    #: "anthropic". Inferred from the base URL when empty, so an existing
+    #: deployment keeps working untouched.
+    llm_provider: str = ""
     #: Lets the assistant be switched off without deleting the keys.
     assistant_enabled: bool = True
     #: Chat answers cost money per message, so they get their own low limit.
@@ -121,6 +125,7 @@ class Settings:
             llm_base_url=env("IDROID_LLM_BASE_URL", "").strip(),
             llm_api_key=env("IDROID_LLM_API_KEY", "").strip(),
             llm_model=env("IDROID_LLM_MODEL", "").strip(),
+            llm_provider=env("IDROID_LLM_PROVIDER", "").strip(),
             assistant_enabled=env("IDROID_ASSISTANT_ENABLED", "true").lower()
             in ("1", "true", "yes"),
             assistant_per_minute=int(env("IDROID_ASSISTANT_PER_MINUTE", "6")),
