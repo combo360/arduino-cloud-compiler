@@ -11,8 +11,13 @@ from __future__ import annotations
 import json
 from typing import AsyncIterator
 
-import httpx
 from pydantic import BaseModel, Field
+
+# The provider abstraction lives in app/providers: this module speaks one shape,
+# each provider adapts it to its vendor, so switching model is a server
+# configuration change and never an app release.
+from .providers import choose_provider
+from .providers.base import ProviderError
 
 TASK_NAMES = ("question", "compileError", "runtimeIssue", "completion")
 
@@ -28,11 +33,15 @@ else.
 refuse it in one sentence: say you only help with Arduino projects in i-Droid, \
 then offer the closest help that is in scope. Never answer the off-topic part.
 
-GROUND EVERY ANSWER IN THE CONTEXT YOU ARE GIVEN:
-- The board, the user's sketch and the compiler or upload output are the truth. \
-Refer to their actual pins and names, not to an example sketch.
-- When the sketch is provided, never reply with a generic tutorial. Say what is \
-wrong in that sketch.
+USE THE CONTEXT THAT WAS SENT — AND ONLY THAT:
+- Answer the question that was asked. A general question ("what is PWM", "how \
+does a servo work") gets a general answer; mention the user's sketch only if it \
+genuinely helps, and never review it unasked.
+- When the question is about their code, the board, the sketch and the compiler \
+or upload output are the truth: refer to their actual pins and names, not to an \
+example sketch.
+- When the sketch comes with a question about their code, never reply with a \
+generic tutorial; say what is wrong in that sketch.
 - If something you need is missing (the wiring, a library version), say which \
 detail you would need instead of guessing.
 
@@ -113,77 +122,14 @@ class ChatRequest(BaseModel):
     history: list[HistoryTurn] = Field(default_factory=list)
 
 
-class ProviderError(Exception):
-    """The model provider refused or could not be reached."""
+def create_provider(settings):
+    """The provider for these settings, or None when the assistant is off.
 
-    def __init__(self, message: str, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
-
-
-class Provider:
-    """Streams from an OpenAI-compatible `/chat/completions` endpoint.
-
-    OpenAI, Groq, Together, OpenRouter and a local Ollama or vLLM all speak
-    this shape, so the server is not tied to one vendor.
+    Pick the vendor with IDROID_LLM_PROVIDER; everything OpenAI-shaped (OpenAI,
+    Groq, OpenRouter, DeepSeek, Ollama, Gemini's compatibility endpoint) shares
+    one implementation, and Anthropic has its own.
     """
-
-    def __init__(self, base_url: str, api_key: str, model: str,
-                 timeout: float = 90.0) -> None:
-        self._url = base_url.rstrip("/") + "/chat/completions"
-        self._api_key = api_key
-        self.model = model
-        self._timeout = timeout
-
-    async def stream(self, messages: list[dict], *, max_tokens: int,
-                     temperature: float) -> AsyncIterator[str]:
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": True,
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream("POST", self._url, headers=headers,
-                                         json=payload) as response:
-                    if response.status_code != 200:
-                        body = (await response.aread()).decode("utf-8", "replace")
-                        raise ProviderError(
-                            f"Model provider answered {response.status_code}: "
-                            f"{body[:200]}",
-                            response.status_code,
-                        )
-                    async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            return
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        for choice in chunk.get("choices") or []:
-                            content = (choice.get("delta") or {}).get("content")
-                            if content:
-                                yield content
-        except httpx.HTTPError as error:
-            raise ProviderError(
-                f"Could not reach the model provider: {error}") from error
-
-
-def create_provider(settings) -> Provider | None:
-    """The provider for these settings, or None when the assistant is off."""
-    if not (settings.llm_base_url and settings.llm_api_key and settings.llm_model):
-        return None
-    return Provider(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
+    return choose_provider(settings)
 
 
 def _clip(text: str | None, limit: int) -> str:
