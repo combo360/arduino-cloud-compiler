@@ -90,6 +90,11 @@ def parse_event(line: str) -> tuple[str, str]:
     kind = event.get("type")
     if kind == "message_stop":
         return "done", ""
+    if kind == "message_delta":
+        # Anthropic stops mid-sentence when it hits the token limit, which read
+        # as a broken answer. Make it visible instead of silent.
+        if (event.get("delta") or {}).get("stop_reason") == "max_tokens":
+            return "text", "\n\n_…(cut off at the answer length limit)_"
     if kind == "content_block_delta":
         delta = event.get("delta") or {}
         if delta.get("type") == "text_delta":
