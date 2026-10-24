@@ -198,10 +198,16 @@ async def stream_answer(provider: Provider, messages: list[dict],
     A failure mid-answer is reported as an `error` event rather than a broken
     connection: the app keeps what it has and offers Retry.
     """
+    # The app asks for 500 tokens, which newer models treat as a hard stop and
+    # then truncate mid-sentence. Give explanatory answers room; the provider's
+    # own ceiling still applies.
+    budget = request.max_tokens
+    if request.task in ("question", "runtimeIssue"):
+        budget = max(budget, 900)
     try:
         async for delta in provider.stream(
             messages,
-            max_tokens=request.max_tokens,
+            max_tokens=budget,
             temperature=request.temperature,
         ):
             yield sse({"delta": delta})
