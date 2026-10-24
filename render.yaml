@@ -21,7 +21,7 @@ services:
       - key: IDROID_ADMIN_KEYS
         sync: false # e.g. "long-random-admin-key:admin"
       - key: IDROID_ALLOW_ANONYMOUS
-        value: "false"
+        value: "true"
       - key: IDROID_COMPILES_PER_MINUTE
         value: "10"
       - key: IDROID_MAX_CONCURRENT_COMPILES
