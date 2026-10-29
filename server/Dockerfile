@@ -2,12 +2,13 @@
 FROM python:3.12-slim-trixie
 
 ARG ARDUINO_CLI_VERSION=1.2.2
-# Cores baked into the image so the first compile is fast. For ESP32 add
-#   --build-arg PREINSTALL_CORES="arduino:avr esp32:esp32"
-#   --build-arg PREINSTALL_URLS=https://espressif.github.io/arduino-esp32/package_esp32_index.json
-# (the ESP32 core adds well over 1 GB to the image).
-ARG PREINSTALL_CORES="arduino:avr"
-ARG PREINSTALL_URLS=""
+# Cores baked into the image so the first compile is fast. The ESP32 core
+# adds well over 1 GB; for an AVR-only image build with
+#   --build-arg PREINSTALL_CORES=arduino:avr --build-arg PREINSTALL_URLS=
+ARG PREINSTALL_CORES="arduino:avr esp32:esp32"
+ARG PREINSTALL_URLS="https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+# Board index URLs the server starts with (Boards Manager → URLs in the app).
+ENV IDROID_DEFAULT_BOARD_URLS=${PREINSTALL_URLS}
 
 # clang-format powers Auto Format (Arduino's style file is in app/).
 RUN apt-get update \
@@ -55,9 +56,12 @@ RUN arduino-cli lib update-index \
  && sed 's/\r$//' /opt/preinstall-libraries.txt | grep -v '^#' | sed '/^$/d' | while IFS= read -r lib; do \
       arduino-cli lib install "$lib" || echo "WARNING: could not install library: $lib"; \
     done
-# Compile an empty sketch once so the Uno core is already in the build cache.
+# Compile an empty sketch once per preinstalled core so each core is already
+# in the build cache (the first ESP32 compile otherwise takes minutes).
 RUN mkdir -p /tmp/warmup && printf 'void setup(){}\nvoid loop(){}\n' > /tmp/warmup/warmup.ino \
  && arduino-cli compile --fqbn arduino:avr:uno /tmp/warmup \
+ && if echo " ${PREINSTALL_CORES} " | grep -q " esp32:esp32"; then \
+      arduino-cli compile --fqbn esp32:esp32:esp32 /tmp/warmup; fi \
  && rm -rf /tmp/warmup
 # The server sets these per request; clear the build-time values.
 ENV ARDUINO_DIRECTORIES_DATA= ARDUINO_DIRECTORIES_USER= ARDUINO_BUILD_CACHE_PATH=

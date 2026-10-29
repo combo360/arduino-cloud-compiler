@@ -2,7 +2,6 @@ import base64
 import json
 import os
 import shutil
-import stat
 import sys
 from pathlib import Path
 
@@ -20,11 +19,13 @@ OTHER = {"X-API-Key": "other-key"}
 ADMIN = {"X-API-Key": "admin-key"}
 
 
+def user_of(call: dict) -> str:
+    """The library folder a fake arduino-cli call used, with / separators."""
+    return Path(call["user"]).as_posix()
+
+
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    wrapper = tmp_path / "arduino-cli"
-    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {FAKE} \"$@\"\n")
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
     log = tmp_path / "calls.jsonl"
     monkeypatch.setenv("FAKE_CLI_LOG", str(log))
     builtin = tmp_path / "examples"
@@ -37,7 +38,7 @@ def env(tmp_path, monkeypatch):
         builtin_examples_dir=builtin,
         api_keys={"user-key": "alice", "other-key": "bob"},
         admin_keys={"admin-key": "admin"},
-        arduino_cli=str(wrapper),
+        arduino_cli=[sys.executable, str(FAKE)],  # works on Windows and Linux
         data_dir=tmp_path / "data",
         compiles_per_minute=3,
     )
@@ -71,7 +72,7 @@ def test_compile_returns_base64_hex(env):
     assert base64.b64decode(body["hex"]).decode() == ":00000001FF\n"  # not with_bootloader
     assert body["format"] == "hex" and body["fqbn"] == "arduino:avr:uno"
     compile_call = [c for c in calls() if c["args"][0] == "compile"][0]
-    assert compile_call["user"].endswith("users/alice")
+    assert user_of(compile_call).endswith("users/alice")
 
 
 def test_compile_multi_file_sketch(env):
@@ -99,8 +100,29 @@ def test_esp32_returns_binary(env):
     client, _, _ = env
     r = client.post("/v1/compile", headers=USER,
                     json={"sketch": "x", "fqbn": "esp32:esp32:esp32"})
-    assert r.json()["format"] == "bin"
-    assert base64.b64decode(r.json()["binary"]) == b"\xe9BIN"
+    body = r.json()
+    assert body["format"] == "bin"
+    assert base64.b64decode(body["binary"]) == b"\xe9BIN"
+    # Every image with its offset, for flashing from the phone.
+    assert body["flash"] == {"mode": "dio", "freq": "80m", "size": "4MB"}
+    assert [(i["offset"], i["name"], base64.b64decode(i["data"])) for i in body["images"]] == [
+        (0x1000, "sketch.ino.bootloader.bin", b"BOOT"),
+        (0x8000, "sketch.ino.partitions.bin", b"PART"),
+        (0xE000, "boot_app0.bin", b"OTA0"),
+        (0x10000, "sketch.ino.bin", b"\xe9BIN"),
+    ]
+
+
+def test_flash_args_parsing(tmp_path):
+    from app import cli as clib
+    assert clib.parse_flash_args(tmp_path) is None
+    (tmp_path / "flash_args").write_text("--flash-mode dio --flash-size 4MB\n0x0 ../etc/passwd\n")
+    assert clib.parse_flash_args(tmp_path) is None  # outside the build folder
+    (tmp_path / "app.bin").write_bytes(b"A")
+    (tmp_path / "flash_args").write_text("--flash-size 8MB\n0x10000 app.bin\nbad line here\n")
+    parsed = clib.parse_flash_args(tmp_path)
+    assert parsed["settings"] == {"size": "8MB"}
+    assert parsed["images"] == [{"offset": 0x10000, "name": "app.bin", "data": "QQ=="}]
 
 
 @pytest.mark.parametrize("payload", [
@@ -160,8 +182,8 @@ def test_libraries_are_per_user(env):
     client.get("/v1/libraries/installed", headers=OTHER)
     install, listing = calls()[-2], calls()[-1]
     assert install["args"][:3] == ["lib", "install", "MQTT@2.5.3"]
-    assert install["user"].endswith("users/alice")
-    assert listing["user"].endswith("users/bob")
+    assert user_of(install).endswith("users/alice")
+    assert user_of(listing).endswith("users/bob")
 
 
 def test_library_search_and_versions(env):
@@ -247,7 +269,7 @@ def test_missing_library_is_installed_and_compile_retried(env):
     assert "Installed library MQTT (provides MyMqtt.h)." in body["logs"]
     installs = [c for c in calls() if c["args"][:2] == ["lib", "install"]]
     assert [c["args"][2] for c in installs] == ["Servo", "MQTT"]
-    assert all(c["user"].endswith("users/alice") for c in installs)
+    assert all(user_of(c).endswith("users/alice") for c in installs)
     # Servo comes from the built-in table, MQTT from `lib search provides:`.
     searches = [c["args"][2] for c in calls() if c["args"][:2] == ["lib", "search"]]
     assert searches == ["provides:MyMqtt.h"]
@@ -334,3 +356,26 @@ def test_missing_header_parsing_and_library_choice():
     assert clib.pick_library("Adafruit_SSD1306.h", data) == "Adafruit SSD1306"
     assert clib.pick_library("Other.h", data) == "Some Fork"
     assert clib.pick_library("Other.h", {"libraries": []}) is None
+
+
+def test_default_board_urls_until_changed(env):
+    _, _, settings = env
+    url = "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+    settings.default_board_urls = [url]
+    client = TestClient(create_app(settings))
+    assert client.get("/v1/boards/urls", headers=USER).json() == {"urls": [url]}
+    assert client.request("DELETE", "/v1/boards/urls", headers=ADMIN,
+                          params={"url": url}).json()["urls"] == []
+    assert client.get("/v1/boards/urls", headers=USER).json() == {"urls": []}
+
+
+def test_default_board_urls_from_env(monkeypatch):
+    monkeypatch.setenv("IDROID_DEFAULT_BOARD_URLS", "https://a/x.json, https://b/y.json")
+    assert Settings.from_env().default_board_urls == ["https://a/x.json", "https://b/y.json"]
+
+
+def test_api_keys_tolerate_quotes_and_lines():
+    from app.config import _parse_keys
+    assert _parse_keys('"k1:alice,k2:bob"') == {"k1": "alice", "k2": "bob"}
+    assert _parse_keys("k1:alice\n 'k2:bob' ") == {"k1": "alice", "k2": "bob"}
+    assert _parse_keys(" k3 ") == {"k3": "user1"}

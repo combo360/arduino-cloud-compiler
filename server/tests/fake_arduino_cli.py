@@ -57,8 +57,24 @@ if cmd == ["compile", "--fqbn"]:
     if fqbn.startswith("esp32:"):
         (out_dir / f"{stem}.ino.bin").write_bytes(b"\xe9BIN")
         (out_dir / f"{stem}.ino.bootloader.bin").write_bytes(b"BOOT")
+        if "--build-path" in args:
+            # What the arduino-esp32 3.x core writes into the build folder.
+            bp = Path(args[args.index("--build-path") + 1])
+            bp.mkdir(parents=True, exist_ok=True)
+            (bp / f"{stem}.ino.bin").write_bytes(b"\xe9BIN")
+            (bp / f"{stem}.ino.bootloader.bin").write_bytes(b"BOOT")
+            (bp / f"{stem}.ino.partitions.bin").write_bytes(b"PART")
+            (bp / "boot_app0.bin").write_bytes(b"OTA0")
+            (bp / "flash_args").write_text(
+                "--flash-mode dio --flash-freq 80m --flash-size 4MB\n"
+                f"0x1000 {stem}.ino.bootloader.bin\n"
+                f"0x8000 {stem}.ino.partitions.bin\n"
+                "0xe000 boot_app0.bin\n"
+                f"0x10000 {stem}.ino.bin\n")
     else:
-        (out_dir / f"{stem}.ino.hex").write_text(":00000001FF\n")
+        # newline="\n": without it Windows stores \r\n and the tests, which
+        # read the hex back, only pass on Linux.
+        (out_dir / f"{stem}.ino.hex").write_text(":00000001FF\n", newline="\n")
         (out_dir / f"{stem}.ino.with_bootloader.hex").write_text(":0000000000\n")
     print(f"Sketch uses 924 bytes. Extra files: {','.join(extras) or 'none'}")
     sys.exit(0)

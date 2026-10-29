@@ -30,7 +30,9 @@ def choose_provider(settings) -> Provider | None:
     if not (settings.llm_api_key and settings.llm_model):
         return None
 
-    kind = (settings.llm_provider or _infer(settings)).strip().lower()
+    # getattr, not settings.llm_provider: a settings object from an older
+    # deployment may not have the field yet, and that must not be fatal.
+    kind = (getattr(settings, "llm_provider", "") or _infer(settings)).strip().lower()
     for fragment, name in _NATIVE_HOSTS.items():
         if kind == fragment:
             kind = name

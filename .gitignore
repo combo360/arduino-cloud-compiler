@@ -3,3 +3,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+
+# test / build artefacts
+pytest-of-*/
+.pytest_cache/
+__pycache__/
+*.pyc
+.venv/

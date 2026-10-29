@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "addons": [
+    {
+      "id": "multilib:avr25",
+      "kind": "multilib",
+      "version": 1,
+      "url": "/static/addons/avr25.zip",
+      "sha256": "238fd6a5ec38941e21982c256da71aeb461afa18c62b1447f974b4628fc46646",
+      "bytes": 377203,
+      "description": "ATtiny with movw \u00b7 ATtiny85 and friends"
+    },
+    {
+      "id": "multilib:avr4",
+      "kind": "multilib",
+      "version": 1,
+      "url": "/static/addons/avr4.zip",
+      "sha256": "d33ac847dc608a31fbac4dc94d42b249bf15f64be4f7f5623aeac8a0c4e6d55c",
+      "bytes": 189504,
+      "description": "ATmega48/88/168/328p \u00b7 Leonardo, Micro (ATmega32U4)"
+    },
+    {
+      "id": "multilib:avr6",
+      "kind": "multilib",
+      "version": 1,
+      "url": "/static/addons/avr6.zip",
+      "sha256": "932c8bcad940e0c10a8efe2472e9a4012531073656b7e36f154ae8a0bcc38c52",
+      "bytes": 192160,
+      "description": "ATmega640/1280/2560 \u00b7 Arduino Mega 2560"
+    }
+  ]
+}

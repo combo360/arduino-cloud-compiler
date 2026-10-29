@@ -7,6 +7,7 @@ below accept both so the server keeps working across upgrades.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -38,8 +39,10 @@ class CliResult:
 
 
 class ArduinoCli:
-    def __init__(self, executable: str, data_dir: Path):
-        self.executable = executable
+    def __init__(self, executable: str | list[str], data_dir: Path):
+        # A path, or a command with arguments (the tests run a Python fake
+        # as [python, fake_arduino_cli.py], which also works on Windows).
+        self.command = [executable] if isinstance(executable, str) else list(executable)
         self.data_dir = data_dir
 
     def _env(self, user_dir: Path | None) -> dict[str, str]:
@@ -60,7 +63,7 @@ class ArduinoCli:
         timeout: float = 120,
         additional_urls: list[str] | None = None,
     ) -> CliResult:
-        argv = [self.executable, *args]
+        argv = [*self.command, *args]
         if additional_urls:
             argv += ["--additional-urls", ",".join(additional_urls)]
         if user_dir is not None:
@@ -297,3 +300,46 @@ def pick_library(header: str, search_data: Any) -> str | None:
         if _norm(lib["name"]) == base:
             return lib["name"]
     return libs[0]["name"]
+
+
+# --------------------------------------------------------------------------
+# ESP32 flash images
+# --------------------------------------------------------------------------
+
+_FLASH_FLAG_RE = re.compile(r"--flash[-_](mode|freq|size)\s+(\S+)")
+
+
+def parse_flash_args(build_path: Path) -> dict | None:
+    """Reads the `flash_args` file that the arduino-esp32 core (3.x) writes
+    into the build folder: flash settings on the first line, then one
+    "<offset> <file>" line per image. Returns the settings and the images
+    (base64) in the format the app expects, or None if the file is missing
+    or refers to files that do not exist."""
+    path = build_path / "flash_args"
+    if not path.is_file():
+        return None
+    lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
+    if not lines:
+        return None
+    settings = {k: v for k, v in _FLASH_FLAG_RE.findall(lines[0])}
+    images = []
+    for line in lines[1:] if settings else lines:
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        offset_text, name = parts
+        try:
+            offset = int(offset_text, 0)
+        except ValueError:
+            continue
+        file = (build_path / name.strip('"')).resolve()
+        if build_path.resolve() not in file.parents or not file.is_file():
+            return None
+        images.append({
+            "offset": offset,
+            "name": file.name,
+            "data": base64.b64encode(file.read_bytes()).decode(),
+        })
+    if not images:
+        return None
+    return {"settings": settings, "images": images}
