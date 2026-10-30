@@ -30,6 +30,7 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY tools ./tools
 
 COPY docker-entrypoint.sh /usr/local/bin/
 # Strip Windows line endings in case the file was edited on Windows.
@@ -52,6 +53,11 @@ RUN URLS=""; [ -n "${PREINSTALL_URLS}" ] && URLS="--additional-urls ${PREINSTALL
  && for core in ${PREINSTALL_CORES}; do arduino-cli core install "$core" $URLS; done
 # Shared libraries: a failed library is reported in the build log but does not
 # stop the build (unlike the original server, the failure is visible).
+# Compact the 57 MB index into a few MB the server can load in a 512 MB
+# container (parsing the full file there gets the worker OOM-killed).
+RUN python /srv/tools/compact_library_index.py \
+      /opt/arduino15/library_index.json /opt/arduino15/library_urls.json || \
+    echo "WARNING: could not compact the library index"
 RUN arduino-cli lib update-index \
  && sed 's/\r$//' /opt/preinstall-libraries.txt | grep -v '^#' | sed '/^$/d' | while IFS= read -r lib; do \
       arduino-cli lib install "$lib" || echo "WARNING: could not install library: $lib"; \

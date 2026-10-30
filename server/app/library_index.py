@@ -34,6 +34,10 @@ DEFAULT_TTL_S = 600
 #: Candidate locations, relative to the arduino-cli data directory. Newer
 #: arduino-cli versions keep the index at the root; some layouts nest it.
 _INDEX_CANDIDATES = (
+    #: Compacted by tools/compact_library_index.py at image build time. Parsing
+    #: the full 57 MB index OOM-kills a 512 MB instance (seen as 502 while
+    #: /health stays 200), so this small file is preferred when present.
+    "library_urls.json",
     "library_index.json",
     "libraries/library_index.json",
     "inventory/library_index.json",

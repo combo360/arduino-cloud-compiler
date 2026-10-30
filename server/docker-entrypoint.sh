@@ -39,6 +39,10 @@ seed /opt/build-cache "$DATA/build-cache" .
 # into /opt/arduino15; an existing disk skips the seeding above, so copy it here.
 # Copy only -- never run arduino-cli here: a 57 MB download or a large core copy
 # on the startup path exceeds a 512 MB instance and kills the deploy.
+if [ ! -s "$DATA/library_urls.json" ] && [ -s /opt/arduino15/library_urls.json ]; then
+  echo "Seeding the compact library index from the image..."
+  cp /opt/arduino15/library_urls.json "$DATA/library_urls.json" || true
+fi
 if [ ! -s "$DATA/library_index.json" ] && [ -s /opt/arduino15/library_index.json ]; then
   echo "Seeding the library index from the image..."
   cp /opt/arduino15/library_index.json "$DATA/library_index.json" || true
