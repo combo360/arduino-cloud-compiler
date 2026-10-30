@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import time
 from pathlib import Path
@@ -30,6 +31,15 @@ log = logging.getLogger("idroid.library_index")
 #: How long a parsed index stays valid. The index itself changes rarely; ten
 #: minutes keeps repeat downloads cheap without serving stale entries for long.
 DEFAULT_TTL_S = 600
+
+#: How long a lazy refresh may take. Deliberately shorter than any client's
+#: patience and *never* on the startup path: a missing index must not delay the
+#: health check (that mistake took the service down once already).
+REFRESH_TIMEOUT_S = 90
+
+#: Do not retry a failed refresh more often than this, so a broken CLI or a
+#: flaky network cannot turn every download into a 90s wait.
+REFRESH_RETRY_S = 600
 
 #: Candidate locations, relative to the arduino-cli data directory. Newer
 #: arduino-cli versions keep the index at the root; some layouts nest it.
@@ -124,6 +134,11 @@ class LibraryIndex:
         self.loads = 0
         #: Set by tests to bypass the TTL.
         self.force_reload = False
+        #: Lazy refresh bookkeeping: at most one attempt per REFRESH_RETRY_S.
+        self._refresh_attempted_at = 0.0
+        self._refresh_lock = asyncio.Lock()
+        #: Set by tests to keep them offline and fast.
+        self.allow_refresh = True
 
     @property
     def data_dir(self) -> Path:
@@ -144,6 +159,9 @@ class LibraryIndex:
                 return self._entries or {}
             path = find_index_file(self._data_dir)
             if path is None:
+                await self._refresh_once()
+                path = find_index_file(self._data_dir)
+            if path is None:
                 raise LibraryIndexUnavailable(
                     f"No library index at {self._data_dir}. "
                     "Run `arduino-cli lib update-index` once."
@@ -161,6 +179,49 @@ class LibraryIndex:
                      len(self._entries), path)
             return self._entries
 
+    async def _refresh_once(self) -> None:
+        """Fetch the index once, bounded, and never on the startup path.
+
+        A hosted data disk that already exists skips the image's seeding, so the
+        index can legitimately be absent on a live instance. Fetching it here
+        means only the first download request pays the cost, the timeout caps it,
+        and a failure is a warning plus the existing typed 503 - never a crash
+        and never a delayed health check.
+        """
+        if not self.allow_refresh:
+            return
+        now = time.monotonic()
+        if self._refresh_attempted_at and (now - self._refresh_attempted_at) < REFRESH_RETRY_S:
+            return
+        async with self._refresh_lock:
+            if self._refresh_attempted_at and (time.monotonic() - self._refresh_attempted_at) < REFRESH_RETRY_S:
+                return
+            self._refresh_attempted_at = time.monotonic()
+            env = dict(os.environ)
+            env["ARDUINO_DIRECTORIES_DATA"] = str(self._data_dir)
+            env["ARDUINO_DIRECTORIES_USER"] = str(self._data_dir)
+            log.info("library index missing - fetching it (max %ss)", REFRESH_TIMEOUT_S)
+            process = None
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "arduino-cli", "lib", "update-index",
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                output, _ = await asyncio.wait_for(process.communicate(), REFRESH_TIMEOUT_S)
+                if process.returncode != 0:
+                    log.warning("library index refresh exited %s: %s",
+                                process.returncode, (output or b"")[-400:].decode("utf-8", "replace"))
+                else:
+                    log.info("library index refreshed")
+            except asyncio.TimeoutError:
+                log.warning("library index refresh timed out after %ss", REFRESH_TIMEOUT_S)
+                if process is not None:
+                    try: process.kill()
+                    except ProcessLookupError: pass
+            except OSError as error:
+                log.warning("library index refresh unavailable: %s", error)
     async def archive_url(self, name: str, version: str = "") -> str | None:
         """Archive URL for ``name`` (exact or latest), or None if not found."""
         wanted = (name or "").strip()
