@@ -35,19 +35,5 @@ seed() {  # seed <from> <to> <marker inside from>
 seed /opt/arduino15 "$DATA/arduino15" packages
 seed /opt/arduino-shared "$DATA/shared" libraries
 seed /opt/build-cache "$DATA/build-cache" .
-# The server serves keyless library downloads from a library index it expects at
-# $DATA/library_index.json. The image bakes one into /opt/arduino15, but an
-# existing disk skips the seeding above, so ensure it is present here -- without
-# it GET /v1/libraries/download answers 503 "No library index".
-if [ ! -s "$DATA/library_index.json" ] && [ -s /opt/arduino15/library_index.json ]; then
-  echo "Seeding the library index from the image..."
-  cp /opt/arduino15/library_index.json "$DATA/library_index.json" || true
-fi
-if [ ! -s "$DATA/library_index.json" ]; then
-  echo "Fetching the library index (first start)..."
-  ARDUINO_DIRECTORIES_DATA="$DATA" ARDUINO_DIRECTORIES_USER="$DATA" \
-    arduino-cli lib update-index \
-    || echo "WARNING: could not fetch the library index; keyless downloads will answer 503 until it exists"
-fi
 mkdir -p "$DATA/users" "$DATA/staging"
 exec "$@"
